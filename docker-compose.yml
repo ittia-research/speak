@@ -1,0 +1,28 @@
+services:
+  inference:
+    build: 
+      context: ./app
+      dockerfile: inference/Dockerfile
+    shm_size: '1gb'
+    ports:
+      - "18000:8000"
+      - "18001:8001"
+      - "18002:8002"
+    volumes:
+      - /data/models:/data/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ./app
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "30051:30051"
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+grpcio==1.71.0
+grpcio-tools==1.71.0
+soundfile==0.13.1
+numpy
+tritonclient
+packaging
