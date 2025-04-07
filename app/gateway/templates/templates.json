@@ -1,6 +1,12 @@
 {
-    "default": {
-      "reference_text": "Cloth masks are most effective at filtering out large droplets.",
+    
+    "Ava_en-GB": {
+      "reference_text": " Cloth masks are most effective at filtering out large droplets. ",
       "reference_audio": "Ava_en-GB.wav"
+    },
+    "AvaDragon_general": {
+        "reference_text": " I'm really sorry to hear that you're felling this way. Finding a therapist can be a great step towards felling better. ",
+        "reference_audio": "AvaDragon_general.wav"
     }
-  }
+}
+

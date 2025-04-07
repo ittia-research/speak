@@ -9,19 +9,30 @@ import sys
 import random
 from concurrent import futures
 from functools import partial
+import time # For potential delays/debugging
 
 import grpc
 import numpy as np
-import soundfile as sf # Keep for checking reference audio
+import soundfile as sf
 
 import tritonclient.grpc as grpcclient
 from tritonclient.utils import np_to_triton_dtype, InferenceServerException
 
-# Import updated generated gRPC files (assuming gateway.proto is unchanged from last step)
+# Import LlamaIndex SentenceSplitter
+try:
+    from llama_index.core.node_parser import SentenceSplitter
+    from llama_index.core.schema import Document # SentenceSplitter now often needs Document
+except ImportError:
+    logging.error("llama-index-core is not installed. Please run: pip install llama-index-core")
+    sys.exit(1)
+
+
+# Import updated generated gRPC files
 import gateway_pb2
 import gateway_pb2_grpc
 
 # --- Triton client helper classes/functions ---
+# UserData, callback, prepare_grpc_sdk_request remain the same as the previous version
 class UserData:
     def __init__(self):
         self._completed_requests = queue.Queue()
@@ -36,28 +47,28 @@ def callback(user_data, result, error):
 def prepare_grpc_sdk_request(
     waveform,
     reference_text,
-    target_text,
+    target_text, # Now expects a potentially shorter chunk
     sample_rate=16000,
 ):
     if waveform.dtype != np.float32:
-        logging.warning(f"Input waveform dtype is {waveform.dtype}, converting to float32.")
         waveform = waveform.astype(np.float32)
     assert len(waveform.shape) == 1, "waveform should be 1D"
     assert sample_rate == 16000, "sample rate must be 16000"
 
-    samples = waveform.reshape(1, -1) # Shape (1, N)
-    lengths = np.array([[len(waveform)]], dtype=np.int32) # Shape (1, 1)
+    samples = waveform.reshape(1, -1)
+    lengths = np.array([[len(waveform)]], dtype=np.int32)
 
     inputs = [
         grpcclient.InferInput("reference_wav", samples.shape, np_to_triton_dtype(samples.dtype)),
         grpcclient.InferInput("reference_wav_len", lengths.shape, np_to_triton_dtype(lengths.dtype)),
         grpcclient.InferInput("reference_text", [1, 1], "BYTES"),
-        grpcclient.InferInput("target_text", [1, 1], "BYTES"),
+        grpcclient.InferInput("target_text", [1, 1], "BYTES"), # For the current text chunk
     ]
     inputs[0].set_data_from_numpy(samples)
     inputs[1].set_data_from_numpy(lengths)
     ref_text_bytes = np.array([[reference_text.encode('utf-8')]], dtype=object)
     inputs[2].set_data_from_numpy(ref_text_bytes)
+    # Encode the current text chunk
     target_text_bytes = np.array([[target_text.encode('utf-8')]], dtype=object)
     inputs[3].set_data_from_numpy(target_text_bytes)
     return inputs
@@ -81,186 +92,260 @@ class AudioGatewayServicer(gateway_pb2_grpc.AudioGatewayServicer):
         except Exception as e:
             logging.error(f"Failed to load templates from {self.templates_path}: {e}", exc_info=True)
             sys.exit(1)
+        # You could initialize the splitter here if its config is static
+        # self.text_splitter = SentenceSplitter(chunk_size=400, chunk_overlap=50)
+
 
     def SynthesizeSpeech(self, request, context):
-        request_id = str(uuid.uuid4()) # Unique ID for this specific gateway request handling
-        logging.info(f"[Req ID: {request_id}] Received SynthesizeSpeech request for text: '{request.target_text[:50]}...'")
+        """
+        Handles request: splits text, calls Triton sequentially for chunks, streams audio.
+        """
+        request_id = str(uuid.uuid4()) # ID for the overall client request
+        logging.info(f"[ReqID: {request_id}] Received SynthesizeSpeech request. Target text length: {len(request.target_text)}")
 
-        # 1. Randomly select template
+        # --- 1. Select Template & Load Reference Audio ---
+        # (Same logic as before: random choice, load wav, checks)
         if not self.template_ids:
-             logging.error(f"[Req ID: {request_id}] No template IDs available.")
+             logging.error(f"[ReqID: {request_id}] No template IDs available.")
              context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Server has no configured voice templates.")
              return
         try:
             selected_template_id = random.choice(self.template_ids)
-            logging.info(f"[Req ID: {request_id}] Randomly selected template ID: '{selected_template_id}'")
             template_info = self.templates[selected_template_id]
+            logging.info(f"[ReqID: {request_id}] Selected template ID: '{selected_template_id}'")
+            reference_text = template_info.get("reference_text")
+            reference_audio_path = template_info.get("reference_audio")
+            # (Path validation and loading logic as before...)
+            if not reference_text or not reference_audio_path: # Simplified check
+                 raise ValueError("Template missing reference text or audio path")
+            if not os.path.isabs(reference_audio_path):
+                base_dir = os.path.dirname(self.templates_path)
+                reference_audio_path = os.path.normpath(os.path.join(base_dir, reference_audio_path))
+            if not os.path.exists(reference_audio_path):
+                 raise FileNotFoundError(f"Reference audio file not found: {reference_audio_path}")
+
+            # waveform, sr = sf.read(reference_audio_path, dtype='float32', always_2d=False)
+            waveform, sr = sf.read(reference_audio_path)
+            if sr != 16000: raise ValueError("Reference audio must be 16kHz.")
+            if waveform.ndim > 1: waveform = waveform[:, 0]
+            if waveform.dtype != np.float32: waveform = waveform.astype(np.float32)
+            logging.info(f"[ReqID: {request_id}] Loaded reference audio: {reference_audio_path}")
+
         except Exception as e:
-             logging.error(f"[Req ID: {request_id}] Error selecting template: {e}", exc_info=True)
-             context.abort(grpc.StatusCode.INTERNAL, "Failed to select a voice template.")
-             return
-
-        # 2. Get reference audio/text
-        reference_text = template_info.get("reference_text")
-        reference_audio_path = template_info.get("reference_audio")
-        if not reference_text or not reference_audio_path:
-            logging.error(f"[Req ID: {request_id}] Template '{selected_template_id}' is missing required info.")
-            context.abort(grpc.StatusCode.INTERNAL, "Invalid template configuration for selected voice.")
-            return
-        if not os.path.isabs(reference_audio_path):
-            base_dir = os.path.dirname(self.templates_path)
-            reference_audio_path = os.path.normpath(os.path.join(base_dir, reference_audio_path))
-        if not os.path.exists(reference_audio_path):
-            logging.error(f"[Req ID: {request_id}] Reference audio file not found: {reference_audio_path}")
-            context.abort(grpc.StatusCode.INTERNAL, "Reference audio not found for selected voice.")
+            logging.error(f"[ReqID: {request_id}] Error preparing reference data: {e}", exc_info=True)
+            context.abort(grpc.StatusCode.INTERNAL, f"Failed to prepare reference data: {e}")
             return
 
-        # 3. Load reference audio (ensure float32)
-        try:
-            # Use always_2d=False to ensure 1D array if mono
-            waveform, sr = sf.read(reference_audio_path, dtype='float32', always_2d=False)
-            if sr != 16000:
-                logging.error(f"[Req ID: {request_id}] Ref audio {reference_audio_path} has sr={sr}. Requires 16kHz.")
-                context.abort(grpc.StatusCode.INTERNAL, "Reference audio must be 16kHz.")
-                return
-            if waveform.ndim > 1: # Handle potential stereo files - take first channel
-                logging.warning(f"[Req ID: {request_id}] Reference audio seems to be stereo. Using only the first channel.")
-                waveform = waveform[:, 0]
-            if waveform.dtype != np.float32:
-                 waveform = waveform.astype(np.float32) # Ensure float32
-            logging.info(f"[Req ID: {request_id}] Loaded ref audio: {reference_audio_path} ({len(waveform)} samples, dtype: {waveform.dtype})")
-        except Exception as e:
-            logging.error(f"[Req ID: {request_id}] Error loading ref audio {reference_audio_path}: {e}", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, "Failed to load reference audio.")
-            return
-
-        # 4. Prepare Triton request
+        # --- 2. Split Target Text ---
         target_text = request.target_text
+        text_chunks = []
         try:
-            inputs = prepare_grpc_sdk_request(waveform, reference_text, target_text)
-        except Exception as e:
-            logging.error(f"[Req ID: {request_id}] Error preparing Triton request: {e}", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, "Failed to prepare inference request.")
-            return
-
-        # 5. Call Triton Inference Server (Streaming)
-        user_data = UserData()
-        triton_client = None
-        triton_request_id = f"triton-{request_id}" # Link gateway req ID to Triton req ID
-
-        try:
-            triton_client = grpcclient.InferenceServerClient(url=self.triton_url, verbose=self.verbose)
-            triton_client.start_stream(callback=partial(callback, user_data))
-            outputs = [grpcclient.InferRequestedOutput("waveform")]
-
-            triton_client.async_stream_infer(
-                model_name=self.model_name,
-                inputs=inputs,
-                request_id=triton_request_id, # Use linked ID
-                outputs=outputs,
-                enable_empty_final_response=True,
+            # Note: SentenceSplitter uses character count for chunk_size.
+            # Estimate ~6 chars/word + space -> 64 words * 7 chars/word ~= 450 chars. Adjust as needed.
+            # Overlap helps maintain context between chunks.
+            # Using a callback to estimate word count if needed, or keep it simple.
+            # TO-DO: better solution in edge cases
+            splitter = SentenceSplitter(
+                chunk_size=100,  # Target characters per chunk (tune this)
+                chunk_overlap=0, # Character overlap (tune this)
+                # separator=" ",    # Split by space primarily
+                # paragraph_separator="\n\n", # Respect paragraphs
+                # secondary_chunking_regex="[^,.;。？！]+[,.;。？！]?", # Helps split on punctuation
             )
-            logging.info(f"[Req ID: {request_id}] Sent request to Triton (TritonReqID: {triton_request_id}) for model '{self.model_name}'")
+            # Wrap text in Document for splitter
+            document = Document(text=target_text)
+            # Split into text nodes, then extract text
+            nodes = splitter.get_nodes_from_documents([document])
+            text_chunks = [node.get_content() for node in nodes]
+            logging.info(f"\nTexts after split:")
+            for i in text_chunks:
+                logging.info(f"<<{i}>>")
 
-            # 6. Stream results back to the end user immediately
-            processed_chunk_count = 0
-            while True:
-                result_or_error = user_data._completed_requests.get()
+            # Simple Word Count Check (Optional but recommended for the 64-word rule)
+            final_chunks = []
+            for chunk in text_chunks:
+                word_count = len(chunk.split())
+                if word_count > 75: # Allow some buffer over 64
+                    logging.warning(f"[ReqID: {request_id}] SentenceSplitter produced a chunk with {word_count} words (>{64}). Consider adjusting chunk_size/overlap or adding more robust splitting logic if this is frequent.")
+                if chunk.strip(): # Avoid empty chunks
+                    final_chunks.append(chunk.strip())
+            text_chunks = final_chunks
 
-                if isinstance(result_or_error, InferenceServerException):
-                    logging.error(f"[Req ID: {request_id}] Triton inference exception (TritonReqID: {triton_request_id}): {result_or_error}")
-                    context.set_details(f"Triton inference failed: {result_or_error}")
-                    context.set_code(grpc.StatusCode.INTERNAL)
-                    break # Exit loop
 
-                try:
-                    response = result_or_error.get_response()
-                    # Verify Triton request ID matches if needed (debugging)
-                    # received_triton_id = response.id
-                    # if received_triton_id != triton_request_id:
-                    #    logging.warning(f"[Req ID: {request_id}] Mismatched Triton request ID! Expected {triton_request_id}, got {received_triton_id}")
+            if not text_chunks:
+                 # Handle case where input text is empty or splitting results in nothing
+                 if target_text.strip(): # Input was not empty, but splitting failed
+                      logging.warning(f"[ReqID: {request_id}] Text splitting resulted in zero chunks, using original text.")
+                      text_chunks = [target_text] # Fallback to original text if splitting fails
+                 else:
+                      logging.info(f"[ReqID: {request_id}] Input text was empty. No audio to generate.")
+                      # Return immediately, client will receive an empty stream
+                      return
 
-                except Exception as e:
-                     logging.error(f"[Req ID: {request_id}] Error getting response data from callback object: {e}", exc_info=True)
-                     context.set_details("Error processing Triton callback response.")
-                     context.set_code(grpc.StatusCode.INTERNAL)
-                     break
+            logging.info(f"[ReqID: {request_id}] Split text into {len(text_chunks)} chunks.")
 
-                # Check for final response marker
-                if response.parameters.get("triton_final_response", None) and \
-                   response.parameters["triton_final_response"].bool_param:
-                    logging.info(f"[Req ID: {request_id}] Received final marker from Triton (TritonReqID: {triton_request_id}).")
-                    break
-
-                # Process audio chunk
-                try:
-                    # Get numpy array for 'waveform' output
-                    audio_chunk_np = result_or_error.as_numpy("waveform")
-
-                    if audio_chunk_np is None:
-                        logging.debug(f"[Req ID: {request_id}] Received null 'waveform' numpy array. Skipping.")
-                        continue
-
-                    # *** Ensure float32 and reshape to 1D ***
-                    if audio_chunk_np.dtype != np.float32:
-                        audio_chunk_np = audio_chunk_np.astype(np.float32)
-                    # Use reshape(-1) as in the example tts function
-                    audio_chunk_np = audio_chunk_np.reshape(-1)
-
-                    if audio_chunk_np.size == 0:
-                         logging.debug(f"[Req ID: {request_id}] Received empty chunk after reshape. Skipping.")
-                         continue
-
-                    # *** Convert float32 numpy chunk to bytes ***
-                    audio_bytes = audio_chunk_np.tobytes()
-
-                    # Yield the raw bytes back to the connected client
-                    yield gateway_pb2.AudioChunk(audio_data=audio_bytes)
-                    processed_chunk_count += 1
-                    logging.debug(f"[Req ID: {request_id}] Sent chunk {processed_chunk_count} ({len(audio_bytes)} bytes, {len(audio_chunk_np)} samples) as float32 bytes to client.")
-
-                except InferenceServerException as e:
-                     logging.error(f"[Req ID: {request_id}] Error extracting numpy 'waveform': {e}")
-                     context.set_details(f"Error processing Triton response chunk: {e}")
-                     context.set_code(grpc.StatusCode.INTERNAL)
-                     break
-                except Exception as e:
-                     logging.error(f"[Req ID: {request_id}] Unexpected error processing chunk: {e}", exc_info=True)
-                     context.set_details("Unexpected error processing audio chunk.")
-                     context.set_code(grpc.StatusCode.INTERNAL)
-                     break
-
-            logging.info(f"[Req ID: {request_id}] Finished processing Triton stream. Sent {processed_chunk_count} chunks to client.")
-
-        except InferenceServerException as e:
-            logging.error(f"[Req ID: {request_id}] Triton communication error: {e}", exc_info=True)
-            context.abort(grpc.StatusCode.UNAVAILABLE, f"Could not communicate with Triton: {e}")
-        except grpc.RpcError as e:
-             logging.error(f"[Req ID: {request_id}] gRPC error during Triton communication: {e.code()} - {e.details()}")
-             context.abort(e.code(), f"gRPC error calling Triton: {e.details()}")
         except Exception as e:
-            logging.error(f"[Req ID: {request_id}] Unexpected error during gateway processing: {e}", exc_info=True)
-            context.abort(grpc.StatusCode.INTERNAL, f"An unexpected server error occurred: {e}")
+            logging.error(f"[ReqID: {request_id}] Error during text splitting: {e}", exc_info=True)
+            # Fallback: use the original text if splitting fails
+            text_chunks = [target_text]
+            logging.warning(f"[ReqID: {request_id}] Using original text due to splitting error.")
+
+        # --- 3. Process Chunks Sequentially via Triton ---
+        triton_client = None
+        total_audio_chunks_sent = 0
+        try:
+            # Create Triton client once for the entire request
+            triton_client = grpcclient.InferenceServerClient(url=self.triton_url, verbose=self.verbose)
+            logging.info(f"[ReqID: {request_id}] Triton client created for {self.triton_url}")
+
+            # Loop through each text chunk
+            for i, text_chunk in enumerate(text_chunks):
+                chunk_req_id = f"{request_id}-C{i+1}" # Unique ID for this chunk's Triton request
+                logging.info(f"[ReqID: {request_id}] Processing text chunk {i+1}/{len(text_chunks)} (TritonReqID: {chunk_req_id})")
+                # logging.debug(f"[ReqID: {request_id}] Chunk Text: '{text_chunk}'") # Uncomment for debugging chunk content
+
+                # 3a. Prepare Inputs for this specific chunk
+                try:
+                    inputs = prepare_grpc_sdk_request(waveform, reference_text, text_chunk)
+                except Exception as e:
+                    logging.error(f"[ReqID: {request_id}] Error preparing inputs for chunk {i+1}: {e}", exc_info=True)
+                    # Abort the whole request if input prep fails for a chunk
+                    context.abort(grpc.StatusCode.INTERNAL, f"Failed to prepare inputs for chunk {i+1}: {e}")
+                    # Ensure client is closed in finally block
+                    return # Exit the SynthesizeSpeech method
+
+                # 3b. Setup Triton Stream for this chunk
+                user_data = UserData() # Fresh UserData for each chunk's stream
+                stream_has_error = False
+                try:
+                    triton_client.start_stream(callback=partial(callback, user_data))
+
+                    # 3c. Send Inference Request for this chunk
+                    triton_client.async_stream_infer(
+                        model_name=self.model_name,
+                        inputs=inputs,
+                        request_id=chunk_req_id, # Use the chunk-specific ID
+                        outputs=[grpcclient.InferRequestedOutput("waveform")],
+                        enable_empty_final_response=True,
+                    )
+                    logging.debug(f"[ReqID: {request_id}] Async infer request sent to Triton for chunk {i+1}.")
+
+                    # 3d. Process Audio Stream for this chunk (Inner Loop)
+                    audio_chunks_in_stream = 0
+                    while True:
+                        # Wait for a result/error from the callback for *this* chunk's stream
+                        result_or_error = user_data._completed_requests.get() # Blocking wait
+
+                        if isinstance(result_or_error, InferenceServerException):
+                            logging.error(f"[ReqID: {request_id}] Triton error during chunk {i+1} stream (TritonReqID: {chunk_req_id}): {result_or_error}")
+                            context.set_details(f"Triton inference failed on chunk {i+1}: {result_or_error}")
+                            context.set_code(grpc.StatusCode.INTERNAL)
+                            stream_has_error = True
+                            break # Break inner loop for this chunk
+
+                        try:
+                            response = result_or_error.get_response()
+                            # Optional: Check response.id == chunk_req_id for sanity
+                        except Exception as e:
+                             logging.error(f"[ReqID: {request_id}] Error getting response object for chunk {i+1}: {e}", exc_info=True)
+                             context.set_details("Error processing Triton callback response.")
+                             context.set_code(grpc.StatusCode.INTERNAL)
+                             stream_has_error = True
+                             break # Break inner loop
+
+                        # Check for final marker for *this* chunk's stream
+                        if response.parameters.get("triton_final_response", None) and \
+                           response.parameters["triton_final_response"].bool_param:
+                            logging.debug(f"[ReqID: {request_id}] Received final marker for chunk {i+1} stream.")
+                            break # Successful end of this chunk's stream
+
+                        # Process audio chunk
+                        try:
+                            audio_chunk_np = result_or_error.as_numpy("waveform")
+                            if audio_chunk_np is None: continue # Skip null data
+
+                            if audio_chunk_np.dtype != np.float32:
+                                audio_chunk_np = audio_chunk_np.astype(np.float32)
+                            audio_chunk_np = audio_chunk_np.reshape(-1) # Ensure 1D
+                            if audio_chunk_np.size == 0: continue # Skip empty data
+
+                            audio_bytes = audio_chunk_np.tobytes()
+
+                            # >>> YIELD audio chunk bytes to the connected client <<<
+                            yield gateway_pb2.AudioChunk(audio_data=audio_bytes)
+                            audio_chunks_in_stream += 1
+                            total_audio_chunks_sent += 1
+                            # logging.debug(f"[ReqID: {request_id}] Sent audio chunk {total_audio_chunks_sent} (from text chunk {i+1}) to client.")
+
+                        except InferenceServerException as e: # Error during as_numpy()
+                             logging.error(f"[ReqID: {request_id}] Numpy conversion error for chunk {i+1}: {e}")
+                             context.set_details(f"Numpy conversion error processing chunk {i+1}: {e}")
+                             context.set_code(grpc.StatusCode.INTERNAL)
+                             stream_has_error = True
+                             break # Break inner loop
+                        except Exception as e: # Other processing errors
+                             logging.error(f"[ReqID: {request_id}] Unexpected error processing audio chunk {i+1}: {e}", exc_info=True)
+                             context.set_details("Unexpected error processing audio chunk.")
+                             context.set_code(grpc.StatusCode.INTERNAL)
+                             stream_has_error = True
+                             break # Break inner loop
+
+                    # 3e. Clean up stream for this specific chunk (always attempt)
+                    logging.debug(f"[ReqID: {request_id}] Stopping Triton stream for chunk {i+1}...")
+                    triton_client.stop_stream()
+                    logging.info(f"[ReqID: {request_id}] Finished processing stream for chunk {i+1}. Sent {audio_chunks_in_stream} audio chunks.")
+
+                    # If an error occurred in this chunk's stream, stop processing subsequent chunks
+                    if stream_has_error:
+                        logging.error(f"[ReqID: {request_id}] Aborting processing due to error in chunk {i+1}.")
+                        # The gRPC context details/code should already be set
+                        return # Exit the SynthesizeSpeech method
+
+                except InferenceServerException as e: # Error starting stream or async_infer
+                    logging.error(f"[ReqID: {request_id}] Triton communication error for chunk {i+1}: {e}", exc_info=True)
+                    context.abort(grpc.StatusCode.UNAVAILABLE, f"Triton communication failed for chunk {i+1}: {e}")
+                    return
+                except grpc.RpcError as e: # Underlying gRPC issues
+                     logging.error(f"[ReqID: {request_id}] gRPC error during Triton call for chunk {i+1}: {e.code()} - {e.details()}")
+                     context.abort(e.code(), f"gRPC error calling Triton for chunk {i+1}: {e.details()}")
+                     return
+                except Exception as e: # Other unexpected errors during chunk processing setup
+                     logging.error(f"[ReqID: {request_id}] Unexpected error setting up chunk {i+1}: {e}", exc_info=True)
+                     context.abort(grpc.StatusCode.INTERNAL, f"Unexpected error processing chunk {i+1}: {e}")
+                     return
+
+            # End of loop through text chunks
+            logging.info(f"[ReqID: {request_id}] Successfully processed all {len(text_chunks)} text chunks. Total audio chunks sent: {total_audio_chunks_sent}.")
+
+        except Exception as e:
+            # Catch errors during outer loop setup or client creation
+            logging.error(f"[ReqID: {request_id}] Unexpected error during main processing: {e}", exc_info=True)
+            if not context.is_active(): # Check if context already aborted
+                # Try to abort if not already done
+                try: context.abort(grpc.StatusCode.INTERNAL, f"An unexpected gateway error occurred: {e}")
+                except Exception as abort_e: logging.error(f"[ReqID: {request_id}] Error trying to abort context: {abort_e}")
+            # Fall through to finally block for cleanup
         finally:
+            # Ensure Triton client is closed if it was created
             if triton_client:
                 try:
-                    # Ensure stream cleanup
-                    triton_client.stop_stream(wait_until_complete=False, gracefully=True)
+                    logging.debug(f"[ReqID: {request_id}] Closing Triton client connection.")
                     triton_client.close()
-                    logging.info(f"[Req ID: {request_id}] Closed Triton client connection.")
+                    logging.info(f"[ReqID: {request_id}] Triton client connection closed.")
                 except Exception as e:
-                    logging.warning(f"[Req ID: {request_id}] Error closing Triton stream/client: {e}")
+                    logging.warning(f"[ReqID: {request_id}] Error closing Triton client: {e}")
 
-# --- Server main execution --- (serve function and if __name__ == '__main__' block remain the same as previous version)
+
+# --- Server main execution ---
+# (serve function and if __name__ == '__main__' block remain the same)
 def serve(port, triton_url, model_name, templates_file, verbose):
-    """Starts the gRPC server."""
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     servicer = AudioGatewayServicer(triton_url, model_name, templates_file, verbose)
-
     if servicer.templates:
         gateway_pb2_grpc.add_AudioGatewayServicer_to_server(servicer, server)
         server.add_insecure_port(f'[::]:{port}')
         logging.info(f"Starting gRPC Gateway Server on port {port}...")
+        # (rest of logging and server.start/wait)
         logging.info(f"Connecting to Triton at: {triton_url}")
         logging.info(f"Using Triton model: {model_name}")
         logging.info(f"Using templates from: {templates_file}")
@@ -270,10 +355,10 @@ def serve(port, triton_url, model_name, templates_file, verbose):
     else:
         logging.error("Server startup failed due to template loading issues.")
 
-
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s')
-    parser = argparse.ArgumentParser(description="gRPC Audio Gateway Server")
+    parser = argparse.ArgumentParser(description="gRPC Audio Gateway Server with Text Splitting")
+    # (Arguments remain the same)
     parser.add_argument("--port", type=int, default=30051, help="Port for the gateway server")
     parser.add_argument("--triton-url", type=str, default="inference:8001", help="URL of the Triton Inference Server (gRPC)")
     parser.add_argument("--model-name", type=str, default="spark_tts_decoupled", help="Name of the TTS model on Triton")

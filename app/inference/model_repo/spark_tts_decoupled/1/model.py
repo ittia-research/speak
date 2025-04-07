@@ -160,7 +160,7 @@ class TritonPythonModel:
         """
         # convert input_ids to numpy, with shape [1, sequence_length]
         input_ids = input_ids.cpu().numpy()
-        max_tokens = 1024  # qwen2.5 8196
+        max_tokens = 2048  # qwen2.5 8196
         # https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/model_config.md#unique-inputs-for-tensorrt_llm-model
         input_dict = {
             "request_output_len": np.array([[max_tokens]], dtype=np.int32),

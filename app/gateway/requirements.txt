@@ -4,3 +4,4 @@ soundfile==0.13.1
 numpy
 tritonclient
 packaging
+llama-index-core

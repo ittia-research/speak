@@ -70,5 +70,6 @@ fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
     echo "Starting Triton server"
-    tritonserver --model-repository ${model_repo} --log-verbose=1
+    # --log-verbose=1
+    tritonserver --model-repository ${model_repo} 
 fi
