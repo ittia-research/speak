@@ -5,3 +5,7 @@ numpy
 tritonclient
 packaging
 llama-index-core
+
+# Audio transcoding
+ffmpeg-python
+opuslib

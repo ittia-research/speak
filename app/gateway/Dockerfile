@@ -42,10 +42,15 @@ RUN python -m grpc_tools.protoc \
 RUN touch generated/__init__.py
 
 # Stage 2: Final Production Image
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm AS final
 
 # Set working directory
 WORKDIR /app
+
+# Install audio codec
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libopus-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # # Create a non-root user and group
 # RUN groupadd --system app && useradd --system --gid app app
