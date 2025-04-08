@@ -1,6 +1,17 @@
-A education oriented TTS inference server.
+A education oriented TTS inference API server: gRPC, streaming, long text.
 
-## Research
-### Hypofosys
-- Practice listening with different voices might enhance overall language learning stability.
-  - [ ] Are there situations in which one content bond to one voice helps better with learning, or listening to familiar voices even one's own voices.
+## Features
+- English TTS with existing templates
+- Easy voice clone with a few seconds of voice clip
+- Streaming
+- Long text
+- Supported audio codex: WAV, Opus (WEBM)
+- Supported TTS model:
+  - [Spark-TTS](https://github.com/SparkAudio/Spark-TTS)
+
+## Links
+[Structure](./docs/structure.md)
+
+[Roadmap](./docs/roadmap.md)
+
+[Research](./docs/research.md)

@@ -1,3 +1,10 @@
+## Tech Stack
+- Gateway: gRPC API server with Python
+  - benifits:
+    - Might need different resources allcation than resource heavy ML inference
+    - Obstruct business layer on top of ML inference layer
+- Inference engine: Triton + TensorRT-LLM
+
 ## Audio
 ### processing
 - Add one space at end of every reference text, and end of every text chunks.
