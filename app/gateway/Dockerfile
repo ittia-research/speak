@@ -1,4 +1,5 @@
-# Stage 1: Builder
+# --- Builder ---
+
 # Use a specific Python version matching your development environment
 FROM python:3.11-slim-bookworm AS builder
 
@@ -41,16 +42,12 @@ RUN python -m grpc_tools.protoc \
 # TO-DO: need in sub-dir also?
 RUN touch generated/__init__.py
 
-# Stage 2: Final Production Image
+
+# --- Final Production Image ---
 FROM python:3.11-slim-bookworm AS final
 
 # Set working directory
 WORKDIR /app
-
-# Install audio codec
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg libopus-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 # # Create a non-root user and group
 # RUN groupadd --system app && useradd --system --gid app app
@@ -71,6 +68,7 @@ COPY gateway /app
 ENV PATH="/opt/venv/bin:$PATH"
 # Ensure logs aren't buffered by Python
 ENV PYTHONUNBUFFERED=1
+
 ENV GRPC_PORT=50051
 
 # TO-DO: any better way

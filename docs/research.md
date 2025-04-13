@@ -15,3 +15,6 @@ References:
 TTS models:
   - https://github.com/bytedance/MegaTTS3
   - https://github.com/SparkAudio/Spark-TTS
+
+Related projects:
+  - https://github.com/KoljaB/RealtimeTTS
